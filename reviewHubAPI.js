@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+const { MongoClient } = require("mongodb");
 require("dotenv").config();
 
 // --- GEMINI Setup ---
@@ -8,6 +9,18 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 if (!GEMINI_API_KEY) {
   console.error("❌ ERROR: Missing GEMINI_API_KEY in .env");
+}
+
+// --- MongoDB Setup (Serverless-friendly) ---
+const client = new MongoClient(process.env.MONGO_URI);
+let collabDb;
+
+async function getDb() {
+  if (!collabDb) {
+    await client.connect();
+    collabDb = client.db("collabedu"); // replace with your DB name
+  }
+  return collabDb;
 }
 
 // --- POST /api/reviewhub/generate ---
@@ -45,7 +58,6 @@ The final output must be a JSON array of objects.
 
   try {
     const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-
     const requestBody = { contents: [{ parts: [{ text: prompt }] }] };
 
     const response = await fetch(apiUrl, {
@@ -70,20 +82,14 @@ The final output must be a JSON array of objects.
       : JSON.stringify(candidate);
 
     // Cleanup code blocks
-    const cleaned = text
-      .trim()
-      .replace(/```json/gi, "")
-      .replace(/```/g, "");
+    const cleaned = text.trim().replace(/```json/gi, "").replace(/```/g, "");
 
     // --- SAFE JSON PARSER ---
     let parsed = [];
-
     try {
       parsed = JSON.parse(cleaned);
     } catch (err) {
       console.warn("Normal JSON parse failed. Trying fallback...");
-
-      // Fallback: extract JSON array only
       const match = cleaned.match(/\[[\s\S]*\]/);
       if (match) {
         try {
@@ -95,7 +101,6 @@ The final output must be a JSON array of objects.
     }
 
     return res.json({ questions: parsed });
-
   } catch (err) {
     console.error("❌ ReviewHub Generation Error:", err);
     return res.status(500).json({ error: "Internal Server Error" });
@@ -110,8 +115,8 @@ router.post("/save-score", async (req, res) => {
   }
 
   try {
-    const collabDb = req.app.locals.collabDb;
-    const history = collabDb.collection("quizHistory");
+    const db = await getDb();
+    const history = db.collection("quizHistory");
 
     const topicKey = `${exam}-${topicId}`;
     await history.updateOne(
@@ -122,7 +127,7 @@ router.post("/save-score", async (req, res) => {
             score,
             maxScore,
             date: new Date(),
-            questions: maxScore // NEW FIELD → used for counting questions answered
+            questions: maxScore
           }
         }
       },
@@ -144,8 +149,8 @@ router.get("/average-score", async (req, res) => {
   }
 
   try {
-    const collabDb = req.app.locals.collabDb;
-    const history = collabDb.collection("quizHistory");
+    const db = await getDb();
+    const history = db.collection("quizHistory");
 
     const topicKey = `${exam}-${topicId}`;
     const doc = await history.findOne({ topicKey });
@@ -165,16 +170,13 @@ router.get("/average-score", async (req, res) => {
 });
 
 // --- GET /api/reviewhub/dashboard-stats ---
-// UPDATED → removes timeStudied, adds questionsAnswered
 router.get("/dashboard-stats", async (req, res) => {
   const { exam } = req.query;
-  if (!exam) {
-    return res.status(400).json({ error: "Missing exam parameter" });
-  }
+  if (!exam) return res.status(400).json({ error: "Missing exam parameter" });
 
   try {
-    const collabDb = req.app.locals.collabDb;
-    const history = collabDb.collection("quizHistory");
+    const db = await getDb();
+    const history = db.collection("quizHistory");
 
     const docs = await history
       .find({ topicKey: { $regex: `^${exam}-` } })
@@ -187,19 +189,13 @@ router.get("/dashboard-stats", async (req, res) => {
     docs.forEach((doc) => {
       if (doc.scores?.length) {
         topicsCompleted++;
-
-        // Sum all answered questions
         doc.scores.forEach((s) => {
           questionsAnswered += s?.questions || 0;
         });
       }
     });
 
-    res.json({
-      topicsCompleted,
-      totalTopics,
-      questionsAnswered,
-    });
+    res.json({ topicsCompleted, totalTopics, questionsAnswered });
   } catch (err) {
     console.error("❌ Dashboard Stats Error:", err);
     res.status(500).json({ error: "Failed to get dashboard stats" });
